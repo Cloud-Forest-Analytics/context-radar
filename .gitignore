@@ -1,0 +1,10 @@
+target/
+Cargo.lock
+.venv/
+context_radar.egg-info/
+contextradar/
+reports/
+context-radar.config.json
+data/memory/catalog.json
+data/stations/
+
