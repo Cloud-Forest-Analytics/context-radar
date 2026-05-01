@@ -17,6 +17,7 @@ When you run many Claude sessions across repos, context gets fragmented. This to
 - `kickoff`: assemble selected curated contexts into a non-interactive kickoff packet.
 - `station-add`: save repo-scoped curated memory in Tokyo lanes (`short-term` / `long-term`).
 - `station-monthly`: create monthly knowledge deep dives per repo/lane using Haiku.
+- `topic-pack`: one-command session processing + topic folder organization inside a target repo.
 
 ## Install
 
@@ -36,6 +37,7 @@ context-radar curate --title "Spec-121 split state" --horizon long-term --contex
 context-radar kickoff --horizon both
 context-radar station-add --repo cannopy --horizon long-term --title "Spec 121 decisions" --summary-file reports/latest-authored-context-window.md --tags "spec121,data-plane"
 context-radar station-monthly --repo cannopy --month 2026-04 --horizon long-term
+context-radar topic-pack --repo-cwd /mnt/c/Users/pabto/projects/cannopy-data --max-sessions 8 --max-turns 40
 ```
 
 Default outputs:
@@ -70,6 +72,7 @@ Create or edit `context-radar.config.json`:
 - **Operational metadata:** JSON catalog at `data/memory/catalog.json` (curated context index).
 - **Context artifacts:** markdown/json in `reports/`.
 - **Repo memory lanes:** `data/stations/<repo>/{short-term,long-term}/`.
+- **Per-repo topic packs:** `<repo>/docs/context-memory/{raw,topics,TOPIC-MAP.md}`.
 - **Design intent:** local-first, Rust-native stack; Claude/Haiku does semantic heavy lifting.
 
 ## Open-source roadmap

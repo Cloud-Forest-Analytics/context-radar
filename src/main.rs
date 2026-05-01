@@ -3,10 +3,12 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -30,6 +32,8 @@ enum Commands {
     Kickoff(KickoffArgs),
     StationAdd(StationAddArgs),
     StationMonthly(StationMonthlyArgs),
+    TopicPack(TopicPackArgs),
+    Watch(WatchArgs),
 }
 
 #[derive(Args)]
@@ -126,6 +130,30 @@ struct StationMonthlyArgs {
     horizon: Horizon,
     #[arg(long, default_value = "reports/station-monthly.md")]
     output: PathBuf,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    #[arg(long, default_value_t = 10)]
+    interval_secs: u64,
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    #[arg(long, default_value_t = 40)]
+    max_turns: usize,
+    #[arg(long, default_value = "reports/watch-latest.md")]
+    output: PathBuf,
+}
+
+#[derive(Args)]
+struct TopicPackArgs {
+    #[arg(long)]
+    repo_cwd: PathBuf,
+    #[arg(long)]
+    output_root: Option<PathBuf>,
+    #[arg(long, default_value_t = 8)]
+    max_sessions: usize,
+    #[arg(long, default_value_t = 40)]
+    max_turns: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +253,8 @@ fn main() -> Result<()> {
                 Commands::Kickoff(args) => cmd_kickoff(&cfg, args),
                 Commands::StationAdd(args) => cmd_station_add(&cfg, args),
                 Commands::StationMonthly(args) => cmd_station_monthly(&cfg, args),
+                Commands::TopicPack(args) => cmd_topic_pack(&cfg, args),
+                Commands::Watch(args) => cmd_watch(&cfg, args),
                 Commands::InitConfig => Ok(()),
             }
         }
@@ -507,6 +537,215 @@ fn cmd_station_monthly(cfg: &AppConfig, args: StationMonthlyArgs) -> Result<()> 
     Ok(())
 }
 
+fn cmd_topic_pack(cfg: &AppConfig, args: TopicPackArgs) -> Result<()> {
+    let canonical_repo = fs::canonicalize(&args.repo_cwd)
+        .with_context(|| format!("repo path not found: {}", args.repo_cwd.display()))?;
+    let repo_name = canonical_repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let output_root = args
+        .output_root
+        .unwrap_or_else(|| canonical_repo.join("docs/context-memory"));
+    let raw_dir = output_root.join("raw");
+    let topics_dir = output_root.join("topics");
+    fs::create_dir_all(&raw_dir)?;
+    fs::create_dir_all(&topics_dir)?;
+
+    let sessions = discover_sessions_for_repo(cfg, &canonical_repo, args.max_sessions, args.max_turns)?;
+    if sessions.is_empty() {
+        bail!(
+            "No sessions found for repo {} under watch roots/sessions store.",
+            canonical_repo.display()
+        );
+    }
+
+    let mut topic_map_lines = Vec::new();
+    topic_map_lines.push("# Topic Pack".to_string());
+    topic_map_lines.push(String::new());
+    topic_map_lines.push(format!("- repo: `{}`", canonical_repo.display()));
+    topic_map_lines.push(format!("- generated_at: `{}`", Utc::now().to_rfc3339()));
+    topic_map_lines.push(String::new());
+    topic_map_lines.push("## Sessions".to_string());
+    topic_map_lines.push(String::new());
+
+    let mut generated_count = 0usize;
+    let mut failed = Vec::new();
+    for session in &sessions {
+        match authored_context_artifacts(session) {
+            Ok((topics, entropy, authored)) => {
+                let pack = format!(
+                    "# Session Context Package\n\n- session_id: `{}`\n- project_cwd: `{}`\n- updated_at: `{}`\n\n{}\n\n{}\n\n{}\n",
+                    session.session_id,
+                    session.project_cwd.display(),
+                    session.updated_at.to_rfc3339(),
+                    topics,
+                    entropy,
+                    authored
+                );
+                let md_path = raw_dir.join(format!("{}.md", session.session_id));
+                let json_path = raw_dir.join(format!("{}.json", session.session_id));
+                write_text_file(&md_path, &pack)?;
+                write_json_file(
+                    &json_path,
+                    &serde_json::json!({
+                        "session_id": session.session_id,
+                        "project_cwd": session.project_cwd,
+                        "updated_at": session.updated_at.to_rfc3339(),
+                        "topics_markdown": topics,
+                        "entropy_markdown": entropy,
+                        "authored_window_markdown": authored
+                    }),
+                )?;
+
+                let topic_slug = topic_slug_from_markdown(&pack);
+                remove_stale_topic_copies(&topics_dir, &session.session_id)?;
+                let topic_bucket = topics_dir.join(&topic_slug);
+                fs::create_dir_all(&topic_bucket)?;
+                let topic_copy = topic_bucket.join(format!("{}.md", session.session_id));
+                fs::copy(&md_path, &topic_copy).with_context(|| {
+                    format!(
+                        "failed to copy session pack {} to topic bucket {}",
+                        md_path.display(),
+                        topic_copy.display()
+                    )
+                })?;
+
+                topic_map_lines.push(format!(
+                    "- `{}` -> `topics/{}/{}.md`",
+                    session.session_id, topic_slug, session.session_id
+                ));
+                generated_count += 1;
+            }
+            Err(err) => {
+                failed.push(format!("{} ({})", session.session_id, err));
+            }
+        }
+    }
+
+    if !failed.is_empty() {
+        topic_map_lines.push(String::new());
+        topic_map_lines.push("## Failures".to_string());
+        topic_map_lines.push(String::new());
+        for row in failed {
+            topic_map_lines.push(format!("- {}", row));
+        }
+    }
+
+    let map_path = output_root.join("TOPIC-MAP.md");
+    write_text_file(&map_path, &topic_map_lines.join("\n"))?;
+    println!(
+        "Topic pack generated for {}: {} sessions processed into {}",
+        repo_name,
+        generated_count,
+        output_root.display()
+    );
+    Ok(())
+}
+
+fn cmd_watch(cfg: &AppConfig, args: WatchArgs) -> Result<()> {
+    let sessions_root = expand_path(&cfg.sessions_root);
+    if !sessions_root.exists() {
+        bail!("sessions_root not found: {}", sessions_root.display());
+    }
+    let watch_roots: Vec<PathBuf> = cfg.watch_roots.iter().map(|p| expand_path(p)).collect();
+    let repo_filter = args
+        .repo
+        .as_deref()
+        .map(fs::canonicalize)
+        .transpose()
+        .unwrap_or(None);
+
+    println!(
+        "Watching {} every {}s — Ctrl-C to stop.",
+        sessions_root.display(),
+        args.interval_secs
+    );
+    if let Some(ref r) = repo_filter {
+        println!("  repo filter: {}", r.display());
+    }
+
+    let mut seen: HashMap<PathBuf, SystemTime> = HashMap::new();
+
+    loop {
+        let snapshot = collect_jsonl_mtimes(&sessions_root)?;
+        let changed: Vec<PathBuf> = snapshot
+            .iter()
+            .filter(|(path, mtime)| seen.get(*path).map(|old| old != *mtime).unwrap_or(true))
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        for path in &changed {
+            let Ok(Some(record)) = parse_session_file(path, args.max_turns) else {
+                continue;
+            };
+            if !is_under_watch(&record.project_cwd, &watch_roots) {
+                continue;
+            }
+            if let Some(ref canonical_repo) = repo_filter {
+                let matches = fs::canonicalize(&record.project_cwd)
+                    .map(|p| p == *canonical_repo)
+                    .unwrap_or(false);
+                if !matches {
+                    continue;
+                }
+            }
+
+            println!(
+                "[watch] changed: {} ({})",
+                record.session_id,
+                record.project_cwd.display()
+            );
+
+            match authored_context_artifacts(&record) {
+                Ok((topics, entropy, authored)) => {
+                    let payload = format!(
+                        "# Watch Snapshot\n\n- session_id: `{}`\n- project_cwd: `{}`\n- updated_at: `{}`\n\n{}\n\n{}\n\n{}\n",
+                        record.session_id,
+                        record.project_cwd.display(),
+                        record.updated_at.to_rfc3339(),
+                        topics,
+                        entropy,
+                        authored
+                    );
+                    if let Err(e) = write_text_file(&args.output, &payload) {
+                        eprintln!("[watch] write failed: {e}");
+                    } else {
+                        println!("[watch] wrote {}", args.output.display());
+                    }
+                }
+                Err(e) => eprintln!("[watch] pipeline failed for {}: {e}", record.session_id),
+            }
+        }
+
+        seen = snapshot;
+        std::thread::sleep(Duration::from_secs(args.interval_secs));
+    }
+}
+
+fn collect_jsonl_mtimes(sessions_root: &Path) -> Result<HashMap<PathBuf, SystemTime>> {
+    let mut map = HashMap::new();
+    for project_dir in fs::read_dir(sessions_root)? {
+        let project_dir = project_dir?;
+        if !project_dir.path().is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(project_dir.path())? {
+            let file = file?;
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Ok(meta) = fs::metadata(&path) {
+                if let Ok(mtime) = meta.modified() {
+                    map.insert(path, mtime);
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
 fn matches_horizon(entry: Horizon, filter: HorizonFilter) -> bool {
     matches!(
         (entry, filter),
@@ -624,6 +863,13 @@ fn build_authored_context_window(session: &SessionRecord, topics: &str, entropy:
     run_haiku(&prompt)
 }
 
+fn authored_context_artifacts(session: &SessionRecord) -> Result<(String, String, String)> {
+    let topics = disentangle_topics(session)?;
+    let entropy = extract_entropy_summary(session)?;
+    let authored = build_authored_context_window(session, &topics, &entropy)?;
+    Ok((topics, entropy, authored))
+}
+
 fn run_haiku(prompt: &str) -> Result<String> {
     let output = Command::new("claude")
         .args(["-p", "--model", "haiku", "--output-format", "text", prompt])
@@ -686,6 +932,24 @@ fn discover_sessions(
     records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     records.truncate(max_sessions);
     Ok(records)
+}
+
+fn discover_sessions_for_repo(
+    cfg: &AppConfig,
+    repo_cwd: &Path,
+    max_sessions: usize,
+    max_turns: usize,
+) -> Result<Vec<SessionRecord>> {
+    let mut sessions = discover_sessions(cfg, max_sessions.saturating_mul(5).max(50), max_turns, None::<&str>, false)?;
+    let canonical_repo = fs::canonicalize(repo_cwd)?;
+    sessions.retain(|s| {
+        fs::canonicalize(&s.project_cwd)
+            .map(|p| p == canonical_repo)
+            .unwrap_or(false)
+    });
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.truncate(max_sessions);
+    Ok(sessions)
 }
 
 fn parse_session_file(path: &Path, max_turns: usize) -> Result<Option<SessionRecord>> {
@@ -924,6 +1188,105 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
     let truncated = s.chars().take(max_chars).collect::<String>();
     format!("{truncated}\n\n...[truncated]...")
+}
+
+fn topic_slug_from_markdown(markdown: &str) -> String {
+    let lower = markdown.to_ascii_lowercase();
+
+    let strategy_research = [
+        "hypothesis",
+        "signal",
+        "walk-forward",
+        "backtest",
+        "baseline",
+        "edge",
+        "kelly",
+        "regime",
+        "distribution",
+        "sortino",
+    ];
+    let execution_trading = [
+        "executionbackend",
+        "sessionrunner",
+        "liveexecutionbackend",
+        "place_order",
+        "nautilus",
+        "fill",
+        "order",
+        "drawdown",
+        "trade",
+    ];
+    let data_ingestion_pipeline = [
+        "tradestation",
+        "stream_bars",
+        "live-data-ingestion",
+        "jsonl",
+        "parquet",
+        "watchlist",
+        "bars",
+        "backfill",
+        "rate limit",
+    ];
+    let platform_ops = [
+        "docker",
+        "deploy",
+        "release",
+        "ci",
+        "build",
+        "runtime",
+        "staging",
+        "crucible",
+        "auth token",
+        "oauth",
+    ];
+    let coordination_docs = [
+        "pr #",
+        "issue #",
+        "roadmap",
+        "handoff",
+        "documentation",
+        "talk",
+        "template",
+        "coordination",
+        "cross-team",
+    ];
+
+    // Coarse taxonomy only: avoid brittle micro-topics.
+    let taxonomy: [(&str, &[&str]); 5] = [
+        ("strategy-research", &strategy_research),
+        ("execution-trading", &execution_trading),
+        ("data-ingestion-pipeline", &data_ingestion_pipeline),
+        ("platform-ops", &platform_ops),
+        ("coordination-docs", &coordination_docs),
+    ];
+
+    let mut best = ("mixed-topics", 0usize);
+    for (slug, keys) in taxonomy {
+        let score = keys.iter().filter(|k| lower.contains(**k)).count();
+        if score > best.1 {
+            best = (slug, score);
+        }
+    }
+    best.0.to_string()
+}
+
+fn remove_stale_topic_copies(topics_dir: &Path, session_id: &str) -> Result<()> {
+    if !topics_dir.exists() {
+        return Ok(());
+    }
+    let session_filename = format!("{session_id}.md");
+    for entry in fs::read_dir(topics_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let old_copy = path.join(&session_filename);
+        if old_copy.exists() {
+            fs::remove_file(&old_copy).with_context(|| format!("failed removing stale copy {}", old_copy.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn horizon_lane(horizon: Horizon) -> &'static str {
